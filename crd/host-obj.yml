@@ -1,0 +1,10 @@
+apiVersion: hostmanager.crc.com/v1
+kind: Host
+metadata:
+  name: 10.0.2.15-8123
+  namespace: default
+spec:
+  hostAddress: 10.0.2.15:8123
+  hostInfo: OS:[linux],Arch:[amd64],CPUS:[2]
+  hostStatus: Available
+  hostToken: b038f54222367fa2a53470f1b08b0d09
