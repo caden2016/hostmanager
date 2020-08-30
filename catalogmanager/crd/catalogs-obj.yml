@@ -1,0 +1,12 @@
+apiVersion: catalogmanager.crc.com/v1
+kind: Catalog
+metadata:
+  name: xyz
+  namespace: default
+spec:
+  name: reponame
+  url: http://test.com/path/to/repo
+  username: testuser
+  password: testpassword
+  description: "catalog for cluster xyz"
+status: Available
