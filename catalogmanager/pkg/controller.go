@@ -11,22 +11,16 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
 	"time"
+	apicorev1 "k8s.io/api/core/v1"
 )
 
-const controllerAgentName = "host-controller"
-
 const (
-	SuccessSynced = "Synced"
-
-	MessageResourceSynced = "host synced successfully"
-
-	CATALOG_CRD_NAMESPACE = "default"
-	MAX_PEER_NUM          = 10
 	HOST_CONFIG_PATH      = "./.kube/config"
 )
 
@@ -38,6 +32,7 @@ type Controller struct {
 	catalogSynced    cache.InformerSynced
 	exitSignal       <-chan struct{}
 	name             string
+	localClient      *kubernetes.Clientset
 }
 
 // NewController returns a new host controller
@@ -54,7 +49,11 @@ func NewController(exitSignal <-chan struct{}) (*Controller, error) {
 		return nil, fmt.Errorf("Error building catalog clientset: %s", err.Error())
 	}
 
-	catalogInformerFactory := cataloginformers.NewSharedInformerFactoryWithOptions(catalogClient, time.Second, cataloginformers.WithNamespace(CATALOG_CRD_NAMESPACE))
+	localClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("Error building local clientset: %s", err.Error())
+	}
+	catalogInformerFactory := cataloginformers.NewSharedInformerFactory(catalogClient, time.Second)
 	cataloginformer := catalogInformerFactory.Catalogmanager().V1().Catalogs()
 	utilruntime.Must(catalogscheme.AddToScheme(scheme.Scheme))
 
@@ -64,6 +63,7 @@ func NewController(exitSignal <-chan struct{}) (*Controller, error) {
 		catalogSynced:    cataloginformer.Informer().HasSynced,
 		exitSignal:       exitSignal,
 		name:             "catalogmanager controller",
+		localClient:localClient,
 	}
 
 	klog.Info("Setting up event handlers")
@@ -73,7 +73,7 @@ func NewController(exitSignal <-chan struct{}) (*Controller, error) {
 			catalog := obj.(*catalogmanagerv1.Catalog)
 			if catalog.Status == catalogmanagerv1.Available {
 				//TODO add repo
-				klog.Infof("catalog[%s] added. spec:%+v.", catalog.Name, catalog.Spec)
+				klog.Infof("namespace:[%s], catalog[%s] added. spec:%+v.",catalog.Namespace, catalog.Name, catalog.Spec)
 			}
 		},
 		UpdateFunc: func(old, new interface{}) {
@@ -82,19 +82,21 @@ func NewController(exitSignal <-chan struct{}) (*Controller, error) {
 			if oldCatalog.ResourceVersion == newCatalog.ResourceVersion {
 				//版本一致，就表示没有实际更新的操作，立即返回
 				return
+			} else if oldCatalog.Namespace != newCatalog.Namespace  {
+				return
 			} else if oldCatalog.Status == catalogmanagerv1.UnAvailable && newCatalog.Status == catalogmanagerv1.Available {
 				//TODO add repo
-				klog.Infof("catalog[%s] status from %s to %s", newCatalog.Name, catalogmanagerv1.UnAvailable, catalogmanagerv1.Available)
+				klog.Infof("namespace:[%s], catalog[%s] status from %s to %s",newCatalog.Namespace, newCatalog.Name, catalogmanagerv1.UnAvailable, catalogmanagerv1.Available)
 			} else if oldCatalog.Status == catalogmanagerv1.Available && newCatalog.Status == catalogmanagerv1.UnAvailable {
 				//TODO del repo
-				klog.Infof("catalog[%s] status from %s to %s", newCatalog.Name, catalogmanagerv1.Available, catalogmanagerv1.UnAvailable)
+				klog.Infof("namespace:[%s], catalog[%s] status from %s to %s",newCatalog.Namespace, newCatalog.Name, catalogmanagerv1.Available, catalogmanagerv1.UnAvailable)
 			}
 			//controller.enqueueHost(new)
 		},
 		DeleteFunc: func(obj interface{}) {
 			//TODO del repo
 			catalog := obj.(*catalogmanagerv1.Catalog)
-			klog.Infof("catalog[%s] deleted. spec:%+v ", catalog.Name, catalog.Spec)
+			klog.Infof("namespace:[%s],  catalog[%s] deleted. spec:%+v ",catalog.Namespace, catalog.Name, catalog.Spec)
 			//controller.enqueueHostForDelete(obj)
 		},
 	})
@@ -103,19 +105,32 @@ func NewController(exitSignal <-chan struct{}) (*Controller, error) {
 	return controller, nil
 }
 
-func (c *Controller) DeleteCatalog(name string) {
-	_, err := c.catalogclientset.CatalogmanagerV1().Catalogs(CATALOG_CRD_NAMESPACE).Get(name, metav1.GetOptions{})
+//create ns named cluster-id to manager cluster catalog
+func (c *Controller) CreateNamespace(name string) {
+	_, err := c.localClient.CoreV1().Namespaces().Create(&apicorev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		}})
+	if err != nil {
+		klog.Errorf("cannot create ns: %s, err:%s", name, err)
+	} else {
+		klog.Infof("create ns: %s", name)
+	}
+}
+
+func (c *Controller) DeleteCatalog(namespace, name string) {
+	_, err := c.catalogclientset.CatalogmanagerV1().Catalogs(namespace).Get(name, metav1.GetOptions{})
 	if err != nil && errors.IsNotFound(err) {
-		klog.Infof("delete catalog:[%s] already deleted", name)
+		klog.Infof("namespace:%s, delete catalog:[%s] already deleted",namespace, name)
 	} else if err == nil {
 		//delete
-		if err = c.catalogclientset.CatalogmanagerV1().Catalogs(CATALOG_CRD_NAMESPACE).Delete(name, &metav1.DeleteOptions{}); err != nil {
-			klog.Errorf("delete catalog:[%s] fail:%s", name, err.Error())
+		if err = c.catalogclientset.CatalogmanagerV1().Catalogs(namespace).Delete(name, &metav1.DeleteOptions{}); err != nil {
+			klog.Errorf("namespace:%s, delete catalog:[%s] fail:%s",namespace, name, err.Error())
 		} else {
-			klog.Infof("delete catalog:[%s] success", name)
+			klog.Infof("namespace:%s, delete catalog:[%s] success",namespace, name)
 		}
 	} else {
-		klog.Errorf("get catalog:[%s] fail:%s", name, err.Error())
+		klog.Errorf("namespace:%s, get catalog:[%s] fail:%s",namespace, name, err.Error())
 	}
 }
 
@@ -140,14 +155,14 @@ func (c *Controller) GetNoEmptyValues(catalog *catalogv1.Catalog, type_value, va
 	return value
 }
 
-func (c *Controller) UpdateCatalog(name, status, reponame, reppourl, user, pwd, desp string) {
-	catalog, err := c.catalogclientset.CatalogmanagerV1().Catalogs(CATALOG_CRD_NAMESPACE).Get(name, metav1.GetOptions{})
+func (c *Controller) UpdateCatalog(namespace, name, status, reponame, reppourl, user, pwd, desp string) {
+	catalog, err := c.catalogclientset.CatalogmanagerV1().Catalogs(namespace).Get(name, metav1.GetOptions{})
 	if err != nil && errors.IsNotFound(err) {
-		klog.Infof("create catalog:[%s] to be %s", name, status)
-		if _, err := c.catalogclientset.CatalogmanagerV1().Catalogs(CATALOG_CRD_NAMESPACE).Create(&catalogv1.Catalog{
+		klog.Infof("namespace:%s, create catalog:[%s] to be %s",namespace, name, status)
+		if _, err := c.catalogclientset.CatalogmanagerV1().Catalogs(namespace).Create(&catalogv1.Catalog{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
-				Namespace: CATALOG_CRD_NAMESPACE,
+				Namespace: namespace,
 			},
 			Spec: catalogv1.CatalogSpec{
 				Name:        reponame,
@@ -158,16 +173,16 @@ func (c *Controller) UpdateCatalog(name, status, reponame, reppourl, user, pwd, 
 			},
 			Status: status,
 		}); err != nil {
-			klog.Errorf("create catalog:[%s] to be %s fail:%s", name, status, err.Error())
+			klog.Errorf("namespace:%s, create catalog:[%s] to be %s fail:%s",namespace, name, status, err.Error())
 		} else {
-			klog.Infof("create catalog:[%s] to be %s success", name, status)
+			klog.Infof("namespace:%s, create catalog:[%s] to be %s success",namespace, name, status)
 		}
 	} else if err == nil {
 		//update
-		if _, err = c.catalogclientset.CatalogmanagerV1().Catalogs(CATALOG_CRD_NAMESPACE).Update(&catalogv1.Catalog{
+		if _, err = c.catalogclientset.CatalogmanagerV1().Catalogs(namespace).Update(&catalogv1.Catalog{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:            catalog.Name,
-				Namespace:       CATALOG_CRD_NAMESPACE,
+				Namespace:       namespace,
 				ResourceVersion: catalog.ResourceVersion,
 			},
 			Spec: catalogv1.CatalogSpec{
@@ -179,12 +194,12 @@ func (c *Controller) UpdateCatalog(name, status, reponame, reppourl, user, pwd, 
 			},
 			Status: c.GetNoEmptyValues(catalog, "Status", status),
 		}); err != nil {
-			klog.Errorf("update catalog:[%s] to be %s fail:%s", name, status, err.Error())
+			klog.Errorf("namespace:%s, update catalog:[%s] to be %s fail:%s",namespace, name, status, err.Error())
 		} else {
-			klog.Infof("update catalog:[%s] to be %s success", name, status)
+			klog.Infof("namespace:%s, update catalog:[%s] to be %s success",namespace, name, status)
 		}
 	} else {
-		klog.Errorf("get catalog:[%s] to be %s fail:%s", name, status, err.Error())
+		klog.Errorf("namespace:%s, get catalog:[%s] to be %s fail:%s",namespace, name, status, err.Error())
 	}
 }
 
